@@ -6,7 +6,7 @@ from PySide6.QtGui import QIcon, QPixmap, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,
     QPushButton,QFrame,QSplitter,QListWidget,QListWidgetItem,QTabWidget,QLineEdit,
     QCheckBox,QScrollArea,QMessageBox,QFileDialog,QStatusBar,QMenu,QToolBar,
-    QSizePolicy,QGroupBox,QFormLayout,QAbstractItemView)
+    QSizePolicy,QGroupBox,QFormLayout,QAbstractItemView,QProgressDialog)
 from config import *
 from graphics import ModelScene, ModelView
 
@@ -14,14 +14,21 @@ class RosaCAD(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        icon_path = ASSETS / "rosa_icon.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1440,900)
         self.setMinimumSize(1050,680)
         self.project=None; self.project_path=None
+        self._saved_snapshot = None
         self.sel_rods=set(); self.sel_nodes=set()
         self.selected_type=None; self.selected_index=None
         self.entries={}; self.name_entry=None
         self.sound_on=True; self.show_dims=True; self.q_on_rod=True
         self.rod_bounds=[]; self.node_points=[]
+        # 100% — минимальный масштаб (геометрия исходного размера).
+        # При увеличении растягиваются длины стержней, максимум 8000%.
+        self.zoom_factor = 1.0
         self._intro_done=False
         self._sounds={}
         self._last_selected_rods=set()
@@ -81,15 +88,50 @@ class RosaCAD(QMainWindow):
         self.statusBar().showMessage(text,8000)
         self.statusBar().setStyleSheet(f"color:{color};")
 
+    def _project_snapshot(self):
+        if self.project is None:
+            return None
+        try:
+            # Сравниваем именно содержимое модели, а не флаг, который легко
+            # забыть обновить в одном из обработчиков редактирования.
+            return json.dumps(self.project, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return None
+
+    def _mark_project_saved(self):
+        self._saved_snapshot = self._project_snapshot()
+
     def ask_save_current(self):
-        if self.project is None: return True
-        answer=QMessageBox.question(self,"Текущий проект",
-            "Сохранить текущий проект перед продолжением?",
-            QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No|QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Yes)
-        if answer==QMessageBox.StandardButton.Cancel: return False
-        if answer==QMessageBox.StandardButton.Yes: return self.save_project()
-        return True
+        if self.project is None:
+            return True
+        # Зафиксировать значения полей, если пользователь нажал «На главную»
+        # или закрыл окно, не переводя фокус вручную из редактора.
+        if self.selected_type in ("rod", "node") and hasattr(self, "entries"):
+            try:
+                self.apply_fields()
+            except Exception:
+                pass
+        if self._project_snapshot() == self._saved_snapshot:
+            return True
+        # Собственные подписи кнопок, чтобы диалог не показывал системные
+        # английские Yes / No на компьютерах с соответствующей локалью.
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("Несохранённые изменения")
+        dialog.setText("В проекте есть несохранённые изменения. Сохранить их?")
+        save_button = dialog.addButton("Да", QMessageBox.ButtonRole.YesRole)
+        discard_button = dialog.addButton("Нет", QMessageBox.ButtonRole.NoRole)
+        cancel_button = dialog.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(save_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is cancel_button:
+            return False
+        if clicked is save_button:
+            return self.save_project()
+        if clicked is discard_button:
+            return True
+        return False
 
     def show_home(self):
         self._clear()
@@ -125,7 +167,24 @@ class RosaCAD(QMainWindow):
         self.setCentralWidget(QWidget())
 
     def show_editor(self):
-        if self.project is None: self.project=empty_project()
+        if self.project is None:
+            self.project=empty_project()
+            self._mark_project_saved()
+        # Индикатор остаётся на экране до первого полноценного кадра редактора.
+        # Раньше он закрывался сразу после создания виджетов, ещё до того,
+        # как Qt успевал построить и нарисовать сцену — пользователь видел белое поле.
+        from PySide6.QtWidgets import QApplication
+        self._editor_ready_to_paint = False
+        progress = QProgressDialog("Создаём рабочее поле…", None, 0, 0, self)
+        progress.setWindowTitle("ROSA CAD")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        self._loading_dialog = progress
+        progress.show()
+        QApplication.processEvents()
         self._clear()
         central=QWidget(); outer=QVBoxLayout(central); outer.setContentsMargins(10,10,10,8); outer.setSpacing(8)
         bar=QHBoxLayout()
@@ -138,16 +197,16 @@ class RosaCAD(QMainWindow):
             bar.addWidget(self.make_button(text,fn,text=="Сохранить"))
         outer.addLayout(bar)
         tools=QHBoxLayout()
-        for text,fn in [("＋ Добавить стержень",self.add_rod),("− Удалить выбранные",self.delete_selected),("Дублировать",self.duplicate_selected),("Показать всё",self.zoom_fit),("Сброс масштаба",self.zoom_reset)]:
+        for text,fn in [("＋ Добавить стержень",self.add_rod),("− Удалить выбранные",self.delete_selected),("Дублировать",self.duplicate_selected),("Сброс масштаба",self.zoom_reset)]:
             tools.addWidget(self.make_button(text,fn))
         self.dims_check=QCheckBox("Размеры"); self.dims_check.setChecked(self.show_dims); self.dims_check.toggled.connect(self.toggle_dims)
         self.sound_check=QCheckBox("Звуки"); self.sound_check.setChecked(self.sound_on); self.sound_check.toggled.connect(lambda v:setattr(self,"sound_on",v))
-        self.q_position_check=QCheckBox("q на стержне"); self.q_position_check.setChecked(self.q_on_rod)
+        self.q_position_check=QCheckBox("q сверху стержня"); self.q_position_check.setChecked(False)
         self.q_position_check.toggled.connect(self.toggle_q_position)
         tools.addWidget(self.dims_check); tools.addWidget(self.sound_check); tools.addWidget(self.q_position_check); tools.addStretch()
-        self.zoom_label=QLabel("Масштаб: ×1.00"); tools.addWidget(self.zoom_label)
+        self.zoom_label=QLabel("Масштаб: 100%"); tools.addWidget(self.zoom_label)
         outer.addLayout(tools)
-        splitter=QSplitter(Qt.Orientation.Horizontal)
+        splitter=QSplitter(Qt.Orientation.Horizontal); self.splitter=splitter
         left=QWidget(); ll=QVBoxLayout(left); ll.setContentsMargins(0,0,0,0)
         self.scene=ModelScene(self); self.view=ModelView(self.scene,self)
         ll.addWidget(self.view,1)
@@ -169,12 +228,50 @@ class RosaCAD(QMainWindow):
         self.panel_scroll.setWidget(self.panel_body); rl.addWidget(self.panel_scroll)
         splitter.addWidget(right); splitter.setSizes([1050,340]); outer.addWidget(splitter,1)
         self.setCentralWidget(central)
-        self.refresh_lists(); self.refresh_panel(); self.scene.rebuild()
-        self.scene.selection_changed.connect(self.scene_selection_changed)
+        self.refresh_lists(); self.refresh_panel()
+        self.scene.selectionChanged.connect(self.scene_selection_changed)
         self._install_shortcuts()
         self.status("Редактор готов. Колесо — масштаб, средняя кнопка — перемещение.",TEXT)
-        # Дожидаемся расчёта геометрии виджетов и вписываем всю модель в рабочую область.
-        QTimer.singleShot(0, self.zoom_fit)
+        # Не строим сцену до того, как splitter и все панели получили реальные
+        # размеры. Иначе первый кадр рассчитывался по промежуточному viewport,
+        # а после движения правой панели внезапно пересчитывался правильно.
+        QTimer.singleShot(120, self._finish_editor_layout)
+        # Страховка на случай, если окно скрыто и первый paintEvent не приходит.
+        QTimer.singleShot(15000, self._finish_loading_dialog)
+
+    def _finish_editor_layout(self):
+        if not hasattr(self, "view") or not hasattr(self, "scene"):
+            self._finish_loading_dialog()
+            return
+        from PySide6.QtWidgets import QApplication
+        # Даём Qt завершить layout и вычислить фактическую ширину viewport
+        # после установки размеров splitter и правой панели.
+        QApplication.processEvents()
+        # Принудительно завершаем все отложенные layout-проходы главного окна,
+        # центрального виджета и splitter. Только после этого читаем viewport:
+        # до этого Qt может вернуть промежуточный размер (например, ширину 520 px).
+        central = self.centralWidget()
+        if central is not None and central.layout() is not None:
+            central.layout().activate()
+        if hasattr(self, "splitter") and self.splitter.layout() is not None:
+            self.splitter.layout().activate()
+        QApplication.processEvents()
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.zoom_factor = 1.0
+        self.view.resetTransform()
+        self.scene.rebuild()
+        self.zoom_label.setText("Масштаб: 100%")
+        self._editor_ready_to_paint = True
+        self.view.viewport().update()
+
+    def _finish_loading_dialog(self):
+        dialog = getattr(self, "_loading_dialog", None)
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+            self._loading_dialog = None
 
     def refresh_lists(self):
         self.rod_list.blockSignals(True); self.node_list.blockSignals(True)
@@ -197,8 +294,10 @@ class RosaCAD(QMainWindow):
             if data:
                 (rods if data[0]=="rod" else nodes).add(data[1])
         newly_selected = rods - self._last_selected_rods
-        if newly_selected:
+        newly_selected_nodes = nodes - getattr(self, "_last_selected_nodes", set())
+        if newly_selected or newly_selected_nodes:
             self.play("select")
+        self._last_selected_nodes = set(nodes)
         self._last_selected_rods = set(rods)
         self.sel_rods,self.sel_nodes=rods,nodes
         self._derive_selection()
@@ -226,8 +325,10 @@ class RosaCAD(QMainWindow):
         else:
             self.sel_nodes, self.sel_rods = indexes, set()
         self._derive_selection()
-        if kind == "rod" and indexes - self._last_selected_rods:
+        previous = self._last_selected_rods if kind == "rod" else getattr(self, "_last_selected_nodes", set())
+        if indexes - previous:
             self.play("select")
+        if kind == "node": self._last_selected_nodes = set(indexes)
         self._last_selected_rods = set(self.sel_rods)
         self.refresh_panel()
         self.scene.apply_selection(self.sel_rods, self.sel_nodes)
@@ -252,8 +353,11 @@ class RosaCAD(QMainWindow):
         }
         self._shortcuts=[]
         for sequence, callback in shortcuts.items():
-            shortcut=QShortcut(QKeySequence(sequence),self)
-            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut=QShortcut(QKeySequence(sequence), self)
+            # ApplicationShortcut устраняет потерю сочетаний, когда фокус
+            # находится внутри QGraphicsView или другого дочернего виджета.
+            # В приложении одновременно открывается одно главное окно.
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
 
@@ -305,22 +409,32 @@ class RosaCAD(QMainWindow):
             if self.sel_nodes:
                 self.section("Параметры узлов")
                 self.add_field("F","Продольная сила F, Н (+ вправо)",None)
-                check=QCheckBox("Установить жёсткую опору для всех выбранных узлов")
-                check.setTristate(True); check.setCheckState(Qt.CheckState.PartiallyChecked)
-                check.stateChanged.connect(lambda state: self.batch_support(state))
+                check = QCheckBox("Жёсткая опора для всех выбранных узлов")
+                all_supported = all(bool(self.project["nodes"][i]["support"]) for i in self.sel_nodes)
+                check.setChecked(all_supported)
+                check.toggled.connect(self.batch_support)
                 self.panel_layout.addWidget(check)
             self.panel_layout.addWidget(self.make_button("Применить ко всем выбранным",self.apply_batch,True))
-            self.panel_layout.addWidget(self.make_button("Удалить выбранные стержни",self.delete_selected))
+            if self.sel_rods:
+                self.panel_layout.addWidget(self.make_button("Удалить выбранные стержни",self.delete_selected))
+            if self.sel_nodes and not self.sel_rods:
+                hint = QLabel("Узлы нельзя удалять или дублировать отдельно. Измените параметры узлов или удалите соединённый стержень.")
+                hint.setWordWrap(True); hint.setStyleSheet(f"color:{MUTED};")
+                self.panel_layout.addWidget(hint)
         else:
             self.panel_title.setText("Свойства модели"); self.section("Модель")
             self.panel_layout.addWidget(QLabel(f"Стержней: {len(self.project['rods'])}    Узлов: {len(self.project['nodes'])}"))
             self.panel_layout.addWidget(QLabel("Название проекта"))
-            self.name_entry=QLineEdit(self.project.get("name",""))
-            self.name_entry.editingFinished.connect(self.collect_name)
-            self.panel_layout.addWidget(self.name_entry)
+            project_name = QLabel(self.project.get("name", "Новый проект"))
+            project_name.setWordWrap(True)
+            project_name.setStyleSheet(f"font-family:'{FONTS['bold']}';color:{DARK};")
+            self.panel_layout.addWidget(project_name)
             hint=QLabel("Выберите стержень или узел на схеме либо в списке, чтобы изменить его параметры.")
             hint.setWordWrap(True); hint.setStyleSheet(f"color:{MUTED};")
             self.panel_layout.addWidget(hint)
+            help_text = QLabel("Горячие клавиши\nDelete — удалить выбранные стержни\nCtrl+D — дублировать\nCtrl+S — сохранить\nCtrl+O — открыть\nCtrl+0 — сброс масштаба\nКолесо — масштаб; средняя кнопка — перемещение")
+            help_text.setWordWrap(True); help_text.setStyleSheet(f"background:{LIGHT}; padding:8px; border-radius:8px; color:{TEXT};")
+            self.panel_layout.addWidget(help_text)
         self.panel_layout.addStretch()
 
     def field_changed(self,edit,key):
@@ -356,46 +470,91 @@ class RosaCAD(QMainWindow):
             self.play("success")
         except ValueError as e:QMessageBox.warning(self,"Ошибка ввода",str(e))
 
-    def batch_support(self,state):
-        if state == int(Qt.CheckState.PartiallyChecked): return
-        value = state == int(Qt.CheckState.Checked)
-        for i in self.sel_nodes:
-            self.project["nodes"][i]["support"] = value
-        self.refresh_scene(); self.refresh_panel()
+    def batch_support(self, value):
+        value = bool(value)
+        selected_nodes = set(self.sel_nodes)
+        for i in selected_nodes:
+            if 0 <= i < len(self.project["nodes"]):
+                self.project["nodes"][i]["support"] = value
+        self.refresh_scene()
+        self.refresh_panel()
 
     def collect_name(self):
-        if self.name_entry and self.name_entry.text().strip():
-            self.project["name"]=self.name_entry.text().strip()
-            self.title_label.setText(self.project["name"])
+        # Имя проекта задаётся именем файла при «Сохранить как».
+        return self.project.get("name", "Новый проект")
 
     def add_rod(self):
         self.project["rods"].append(default_rod())
         self.project["nodes"].append({"F":0.0,"support":False})
         self.sel_rods={len(self.project["rods"])-1}; self.sel_nodes=set(); self._derive_selection()
         self.refresh_scene(); self.refresh_panel(); self.play("add")
+        QTimer.singleShot(0, self.zoom_fit)
 
-    def duplicate_rod(self,index=None):
-        if index is None:index=next(iter(self.sel_rods),None)
-        if index is None:return
-        self.project["rods"].insert(index+1,dict(self.project["rods"][index]))
-        self.project["nodes"].insert(index+1,{"F":0.0,"support":False})
-        self.sel_rods={index+1}; self.sel_nodes=set(); self._derive_selection()
-        self.refresh_scene(); self.refresh_panel(); self.play("add")
+    def duplicate_rod(self, index=None):
+        if index is None:
+            index = next(iter(self.sel_rods), None)
+        if index is None:
+            return
+
+        rod_copy = dict(self.project["rods"][index])
+        node_copy = dict(self.project["nodes"][index + 1])
+
+        self.project["rods"].insert(index + 1, rod_copy)
+        self.project["nodes"].insert(index + 1, node_copy)
+
+        self.sel_rods = {index + 1}
+        self.sel_nodes = set()
+        self._derive_selection()
+
+        self.refresh_scene()
+        self.refresh_panel()
+        self.play("add")
+        QTimer.singleShot(0, self.zoom_fit)
 
     def duplicate_selected(self):
-        indexes=sorted(self.sel_rods)
-        if not indexes: return
-        inserted=[]
-        offset=0
-        for original in indexes:
-            pos=original+offset+1
-            self.project["rods"].insert(pos,dict(self.project["rods"][original+offset]))
-            self.project["nodes"].insert(pos,{"F":0.0,"support":False})
-            inserted.append(pos); offset+=1
-        self.sel_rods=set(inserted); self.sel_nodes=set(); self._derive_selection()
-        self.refresh_scene(); self.refresh_panel(); self.play("add")
+        indexes = sorted(self.sel_rods)
+
+        if not indexes:
+            if self.sel_nodes:
+                self.status(
+                    "Узлы отдельно не дублируются: дублируйте соединённые стержни.",
+                    RED
+                )
+                self.play("warn")
+            return
+
+        source_rods = [
+            dict(self.project["rods"][i]) for i in indexes
+        ]
+
+        source_nodes = [
+            dict(self.project["nodes"][i + 1]) for i in indexes
+        ]
+
+        insert_at = indexes[-1] + 1
+
+        for offset, (rod, node) in enumerate(
+                zip(source_rods, source_nodes)
+        ):
+            self.project["rods"].insert(insert_at + offset, rod)
+            self.project["nodes"].insert(insert_at + offset, node)
+
+        self.sel_rods = set(
+            range(insert_at, insert_at + len(source_rods))
+        )
+        self.sel_nodes = set()
+        self._derive_selection()
+
+        self.refresh_scene()
+        self.refresh_panel()
+        self.play("add")
+        QTimer.singleShot(0, self.zoom_fit)
 
     def delete_selected(self):
+        if not self.sel_rods and self.sel_nodes:
+            self.status("Узлы отдельно не удаляются. Чтобы изменить состав модели, удалите соединённый стержень.", RED)
+            self.play("warn")
+            return
         self.delete_rods(set(self.sel_rods))
 
     def delete_rods(self,indexes):
@@ -411,6 +570,7 @@ class RosaCAD(QMainWindow):
             self.project["rods"].pop(i); self.project["nodes"].pop(i+1)
         self.sel_rods=set();self.sel_nodes=set();self._derive_selection()
         self.refresh_scene();self.refresh_panel();self.play("delete")
+        QTimer.singleShot(0, self.zoom_fit)
 
     def toggle_support(self,index):
         node=self.project["nodes"][index];node["support"]=not bool(node["support"])
@@ -424,19 +584,27 @@ class RosaCAD(QMainWindow):
         self.show_dims=bool(value)
         if hasattr(self,"scene"):self.scene.rebuild()
 
-    def toggle_q_position(self,value):
-        self.q_on_rod=bool(value)
-        if hasattr(self,"scene"): self.scene.rebuild()
+    def toggle_q_position(self, value):
+        self.q_on_rod = not bool(value)
+        if hasattr(self, "scene"):
+            self.scene.rebuild()
 
     def zoom_fit(self):
+        # 100% — базовая геометрия. Нельзя отдалить конструкцию ниже этого
+        # значения: для больших моделей используется горизонтальная прокрутка.
+        self.zoom_factor = 1.0
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.view.resetTransform()
-        rect=self.scene.itemsBoundingRect().adjusted(-55,-55,55,55)
-        self.view.fitInView(rect,Qt.AspectRatioMode.KeepAspectRatio)
-        self.zoom_label.setText(f"Масштаб: ×{self.view.transform().m11():.2f}")
+        self.scene.rebuild()
+        self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_label.setText("Масштаб: 100%")
+        # После скрытия полосы прокрутки viewport меняет размер; центрируем
+        # уже по окончательно рассчитанной рабочей области.
+        QTimer.singleShot(0, self.view._center_model)
 
     def zoom_reset(self):
-        self.view.resetTransform()
-        self.zoom_label.setText("Масштаб: ×1.00")
+        self.zoom_fit()
 
     def validate_model(self):
         validate_project(self.project)
@@ -456,20 +624,30 @@ class RosaCAD(QMainWindow):
     def new_project(self):
         if not self.ask_save_current():return
         self.project=empty_project();self.project_path=None
-        self.sel_rods=set();self.sel_nodes=set();self.show_editor()
+        self.sel_rods=set();self.sel_nodes=set();self._mark_project_saved();self.show_editor()
 
     def open_project(self):
-        path,_=QFileDialog.getOpenFileName(self,"Открыть проект","", "Проекты ROSA CAD (*.json);;Все файлы (*.*)")
-        if path:self.load_project(path)
+        default_dir = str(Path.home() / "Documents" / "ROSA CAD Projects")
+        Path(default_dir).mkdir(parents=True, exist_ok=True)
+        path,_=QFileDialog.getOpenFileName(self,"Открыть проект",default_dir, "Проекты ROSA CAD (*.json);;Все файлы (*.*)")
+        if path and self.ask_save_current():self.load_project(path)
 
     def open_last_project(self):
         try:
             data=json.loads(LAST_FILE.read_text(encoding="utf-8"));path=data["path"]
             if not os.path.exists(path):raise FileNotFoundError
-            self.load_project(path)
+            if self.ask_save_current(): self.load_project(path)
         except Exception:QMessageBox.information(self,"ROSA CAD","Последний сохранённый проект не найден.")
 
     def load_project(self,path):
+        progress = QProgressDialog("Открываем проект…", None, 0, 0, self)
+        progress.setWindowTitle("ROSA CAD")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.show()
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
         try:
             data=json.loads(Path(path).read_text(encoding="utf-8"))
             validate_project(data)
@@ -478,8 +656,12 @@ class RosaCAD(QMainWindow):
             for node in data["nodes"]:
                 node["F"]=float(node["F"]);node["support"]=bool(node["support"])
             data.setdefault("name",Path(path).stem)
-        except Exception as e:QMessageBox.critical(self,"Ошибка открытия проекта",str(e));return
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self,"Ошибка открытия проекта",str(e));return
+        progress.close()
         self.project=data;self.project_path=path;self.sel_rods=set();self.sel_nodes=set()
+        self._mark_project_saved()
         self.remember_last_project();self.show_editor()
 
     def remember_last_project(self):
@@ -495,15 +677,31 @@ class RosaCAD(QMainWindow):
             elif self.selected_type=="node":self.apply_fields()
             self.validate_model()
             if save_as or not self.project_path:
-                path,_=QFileDialog.getSaveFileName(self,"Сохранить проект",self.project.get("name","project")+".json","Проекты ROSA CAD (*.json)")
+                default_dir = Path.home() / "Documents" / "ROSA CAD Projects"
+                default_dir.mkdir(parents=True, exist_ok=True)
+                suggested = default_dir / (self.project.get("name", "project") + ".json")
+                path,_=QFileDialog.getSaveFileName(self,"Сохранить проект",str(suggested),"Проекты ROSA CAD (*.json)")
                 if not path:return False
                 if not path.lower().endswith(".json"):path+=".json"
                 self.project_path=path
+                # При сохранении под новым именем синхронизируем имя проекта с именем файла.
+                self.project["name"] = Path(path).stem
+                if hasattr(self, "title_label"):
+                    self.title_label.setText(self.project["name"])
+                if hasattr(self, "panel_layout") and self.selected_type is None:
+                    self.refresh_panel()
             Path(self.project_path).write_text(json.dumps(self.project,ensure_ascii=False,indent=4),encoding="utf-8")
-            self.remember_last_project();self.status(f"Проект сохранён: {self.project_path}");self.play("success");return True
+            self.remember_last_project();self._mark_project_saved();self.status(f"Проект сохранён: {self.project_path}");self.play("success");return True
         except Exception as e:QMessageBox.critical(self,"Ошибка сохранения",str(e));return False
 
     def save_project_as(self):return self.save_project(True)
 
     def back_home(self):
+        if not self.ask_save_current(): return
         self.show_home()
+
+    def closeEvent(self, event):
+        if self.ask_save_current():
+            event.accept()
+        else:
+            event.ignore()

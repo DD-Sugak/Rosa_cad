@@ -28,7 +28,7 @@ ROD_TITLES = {
     "A": "Площадь сечения A, м²",
     "E": "Модуль упругости E, Па",
     "sigma": "Допускаемое напряжение [σ], Па",
-    "q": "Погонная нагрузка q, Н/м (+ вправо)",
+    "q": "Погонная нагрузка q, Н/м",
 }
 FONT_FILES = {"main":"Main.ttf", "bold":"Bold.ttf", "title":"Title.ttf"}
 FONTS = {"main":"Caveat", "bold":"Caveat", "title":"Nautilus Pompilius"}
@@ -51,7 +51,7 @@ def default_rod(length=1.0):
     return {"L":float(length), "A":0.01, "E":2.1e11, "sigma":2.4e8, "q":0.0}
 
 def empty_project():
-    return {"name":"Новый проект", "rods":[default_rod(2.0)],
+    return {"name":"Новый проект", "rods":[default_rod(1.0)],
             "nodes":[{"F":0.0,"support":True},{"F":0.0,"support":False}]}
 
 def validate_project(project):
